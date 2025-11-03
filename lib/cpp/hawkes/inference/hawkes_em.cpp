@@ -59,7 +59,7 @@ double HawkesEM::loglikelihood_ur(const ulong r_u, const ArrayDouble &mu, ArrayD
   double llh = (*end_times)[r];
   std::function<void(double)> add_to_llh = [&llh](double intensity_t_i) {
     if (intensity_t_i <= 0)
-      llh = std::numeric_limits<double>::infinity();
+      llh = std::numeric_limits<double>::max();  // Use max() instead of infinity() for fast-math compatibility
     else
       llh += log(intensity_t_i);
   };

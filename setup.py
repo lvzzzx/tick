@@ -25,13 +25,38 @@ from setuptools import find_packages, setup, Command
 from setuptools.command.install import install
 from setuptools.extension import Extension
 
-# deprecated!
-import distutils
-from distutils.command.build import build
-from distutils.command.clean import clean
-from distutils import sysconfig as distconfig
-# deprecated!
+# Use setuptools instead of deprecated distutils
+try:
+    from setuptools.command.build import build
+    from setuptools.command.clean import clean
+    import distutils.util
+    import distutils
+except ImportError:
+    # Fallback to distutils if setuptools is not available (shouldn't happen)
+    from distutils.command.build import build
+    from distutils.command.clean import clean
+    import distutils.util
+    import distutils
 
+try:
+    from distutils import sysconfig as distconfig
+except ImportError:
+    # Python 3.12+ removed distutils.sysconfig, use sysconfig instead
+    # Import sysconfig (standard library) for the compatibility layer
+    import sysconfig as std_sysconfig
+    # Create a compatibility wrapper that mimics distutils.sysconfig
+    class DistConfigCompat:
+        @staticmethod
+        def get_config_vars(*args):
+            if args:
+                return [std_sysconfig.get_config_var(arg) for arg in args]
+            return std_sysconfig.get_config_vars()
+        
+        @staticmethod
+        def get_config_var(name):
+            return std_sysconfig.get_config_var(name)
+    
+    distconfig = DistConfigCompat()
 
 
 from packaging import version
@@ -80,7 +105,7 @@ use_fast_math = True
 
 version_info = sys.version_info
 
-python_min_ver = (3, 6, 0)
+python_min_ver = (3, 7, 0)
 python_ver = (version_info.major, version_info.minor, version_info.micro)
 
 if python_ver < python_min_ver:
@@ -94,8 +119,18 @@ if python_ver < python_min_ver:
 #
 # Snippet from http://stackoverflow.com/a/32765319/2299947
 if sys.platform == 'darwin':
-    vars = distconfig.get_config_vars()
-    vars['LDSHARED'] = vars['LDSHARED'].replace('-bundle', '-dynamiclib')
+    try:
+        vars = distconfig.get_config_vars()
+        if vars and 'LDSHARED' in vars:
+            vars['LDSHARED'] = vars['LDSHARED'].replace('-bundle', '-dynamiclib')
+    except (AttributeError, TypeError):
+        # If get_config_vars doesn't work, try alternative approach
+        try:
+            ldshared = sysconfig.get_config_var('LDSHARED')
+            if ldshared:
+                os.environ['LDSHARED'] = ldshared.replace('-bundle', '-dynamiclib')
+        except (AttributeError, TypeError):
+            pass  # Skip if we can't modify it
 
 # If we're installing via a wheel or not
 is_building_tick = any(arg in ("build",
@@ -111,7 +146,6 @@ numpy_include = ""
 blas_info = {}
 try:
     import numpy as np
-    from numpy.distutils.system_info import get_info
 
     try:
         numpy_include = np.get_include()
@@ -119,28 +153,38 @@ try:
         numpy_include = np.get_numpy_include()
 
     # Determine if we have an available BLAS implementation
-    if force_blas: # activated with build --force-blas
-        blas_info = get_info("blas_opt", 0)
-    elif platform.system() == 'Windows':
-        try:
-            with open(os.devnull, 'w') as devnull:
-                exitCode = subprocess.check_output(
-                    "python tools/python/blas/check_cblas.py build_ext",
-                    stderr=devnull,
-                    shell=True)
-                blas_info = get_info("blas_opt", 0)
-        except subprocess.CalledProcessError as subError:
-            print("Error executing check_cblas.py - cblas not found")
-    else:
-        try:
-            with open(os.devnull, 'w') as devnull:
-                exitCode = subprocess.check_output(
-                    "python tools/python/blas/check_mkl.py build_ext",
-                    stderr=devnull,
-                    shell=True)
-                blas_info = get_info("blas_opt", 0)
-        except subprocess.CalledProcessError as subError:
-            print("Error executing check_mkl.py - mkl not found")
+    # numpy.distutils is deprecated, try to use it if available, otherwise skip BLAS
+    blas_info = {}
+    try:
+        from numpy.distutils.system_info import get_info
+        
+        if force_blas: # activated with build --force-blas
+            blas_info = get_info("blas_opt", 0)
+        elif platform.system() == 'Windows':
+            try:
+                with open(os.devnull, 'w') as devnull:
+                    exitCode = subprocess.check_output(
+                        "python tools/python/blas/check_cblas.py build_ext",
+                        stderr=devnull,
+                        shell=True)
+                    blas_info = get_info("blas_opt", 0)
+            except (subprocess.CalledProcessError, ImportError, AttributeError) as subError:
+                print("Error executing check_cblas.py - cblas not found, continuing without BLAS")
+        else:
+            try:
+                with open(os.devnull, 'w') as devnull:
+                    exitCode = subprocess.check_output(
+                        "python tools/python/blas/check_mkl.py build_ext",
+                        stderr=devnull,
+                        shell=True)
+                    blas_info = get_info("blas_opt", 0)
+            except (subprocess.CalledProcessError, ImportError, AttributeError) as subError:
+                print("Error executing check_mkl.py - mkl not found, continuing without BLAS")
+    except (ImportError, AttributeError):
+        # numpy.distutils is not available (deprecated in newer numpy versions)
+        # Continue without BLAS optimization
+        warnings.warn("numpy.distutils is not available. Building without BLAS optimization.")
+        blas_info = {}
 
     numpy_available = True
 except ImportError as e:
@@ -159,18 +203,41 @@ if os.environ.get('TICK_NO_OPTS') is not None:
 # By default, we assume that scipy uses 32 bit integers for indices in sparse
 # arrays
 sparse_indices_flag = "-DTICK_SPARSE_INDICES_INT32"
-try:
-    from scipy.sparse import sputils
-
-    sparsearray_type = sputils.get_index_dtype()
-
-    if sparsearray_type == np.int64:
-        sparse_indices_flag = "-DTICK_SPARSE_INDICES_INT64"
-except ImportError as e:
-    if is_building_tick and numpy_available:
-        print(e)
-        warnings.warn("scipy is not installed, unable to determine "
-                      "sparse array integer type (assuming 32 bits)\n")
+if numpy_available:
+    try:
+        # Try multiple methods to get sparse index dtype (compatible with old and new scipy)
+        sparsearray_type = None
+        
+        # Method 1: Try new scipy API (1.11+)
+        try:
+            from scipy.sparse._index import get_index_dtype
+            sparsearray_type = get_index_dtype()
+        except (ImportError, AttributeError):
+            # Method 2: Try deprecated sputils (old scipy versions)
+            try:
+                from scipy.sparse import sputils
+                sparsearray_type = sputils.get_index_dtype()
+            except (ImportError, AttributeError):
+                # Method 3: Determine from a sample sparse matrix
+                try:
+                    from scipy.sparse import csr_matrix
+                    sample = csr_matrix((1, 1))
+                    # Check the indices dtype of the sparse matrix
+                    sparsearray_type = sample.indices.dtype.type
+                except (ImportError, AttributeError):
+                    pass
+        
+        if sparsearray_type is not None:
+            # Compare with int64 type (np is available when numpy_available is True)
+            if sparsearray_type == np.int64:
+                sparse_indices_flag = "-DTICK_SPARSE_INDICES_INT64"
+        elif is_building_tick:
+            warnings.warn("Unable to determine scipy sparse array integer type, "
+                          "assuming 32 bits\n")
+    except Exception as e:
+        if is_building_tick:
+            warnings.warn(f"Error determining sparse array integer type: {e}. "
+                          "Assuming 32 bits\n")
 
 if os.name == 'posix':
     if platform.system() == 'Darwin':
@@ -203,10 +270,50 @@ if os.environ.get('PYVER') is not None:
 
 # Directory containing built .so files before they are moved either
 # in source (with build flag --inplace) or to site-packages (by install)
-# E.g. build/lib.macosx-10.11-x86_64-3.5
-build_dir = "build/lib.{}-{}"+PYVER_DBG
-build_dir = build_dir.format(distutils.util.get_platform(),
-                             ".".join(sys.version.split(".")[:2]))
+# E.g. build/lib.macosx-10.11-x86_64-3.5 or build/lib.macosx-11.0-arm64-cpython-312
+# Try to match what setuptools actually uses
+def get_build_dir():
+    """Get the actual build directory that setuptools creates"""
+    # First, check if build directory exists and find actual lib.* directories
+    if os.path.exists("build"):
+        lib_dirs = [item for item in os.listdir("build") 
+                   if item.startswith("lib.") and os.path.isdir(os.path.join("build", item))]
+        if lib_dirs:
+            # Return the first (most likely) build directory found
+            return os.path.join("build", lib_dirs[0])
+    
+    # Try the new format with cpython tag (what setuptools uses now)
+    try:
+        import sysconfig
+        # Setuptools uses platform tag from distutils.util.get_platform() but with cpython tag
+        try:
+            platform_str = distutils.util.get_platform()
+        except:
+            # Fallback for Python 3.12+ where distutils might not be available
+            platform_str = sysconfig.get_platform().replace('-', '_')
+        
+        py_version_nodot = sysconfig.get_config_var('py_version_nodot')
+        if not py_version_nodot:
+            py_version_nodot = f"{sys.version_info.major}{sys.version_info.minor}"
+        new_format = f"build/lib.{platform_str}-cpython-{py_version_nodot}"
+        return new_format
+    except:
+        pass
+    
+    # Try old format (for older Python versions)
+    try:
+        old_format = "build/lib.{}-{}".format(
+            distutils.util.get_platform(),
+            ".".join(sys.version.split(".")[:2])
+        ) + PYVER_DBG
+        return old_format
+    except:
+        pass
+    
+    # Final fallback - return a path that will be handled by file search
+    return "build/lib.unknown"
+
+build_dir = get_build_dir()
 
 class SwigExtension(Extension):
     """This only adds information about extension construction, useful for
@@ -282,8 +389,8 @@ def create_extension(extension_name, module_dir,
                                                               folder,
                                                               ext))
 
-    min_swig_opts = ['-py3',
-                     '-c++',
+    # SWIG 4.0+ defaults to Python 3, so -py3 is deprecated and causes warnings
+    min_swig_opts = ['-c++',
                      '-Ilib/swig',
                      '-Ilib/include',
                      '-outdir', swig_path.build,
@@ -322,6 +429,9 @@ def create_extension(extension_name, module_dir,
     elif TICK_WERROR == 1 or TICK_WERROR == "1":
         ## Added -Wall to get all warnings and -Werror to treat them as errors
         extra_compile_args.append("-Werror")
+        # Suppress -Wnull-conversion warning from numpy's import_array() macro
+        # This is a known issue with numpy macros on newer compilers
+        extra_compile_args.append("-Wno-null-conversion")
 
     libraries = []
     library_dirs = []
@@ -378,8 +488,11 @@ def create_extension(extension_name, module_dir,
             extra_link_args.append("-Wl,-rpath,"+lib_dir)
             extra_link_args.append("-l:"+mod.lib_filename)
         else:
-            extra_link_args.append(os.path.abspath(
-                os.path.join(build_dir, mod.build, mod.lib_filename)))
+            # For macOS: Python extensions are bundles, not libraries, so we can't link against them
+            # We only set up runtime paths (@loader_path) for dynamic loading at runtime
+            # The linking happens via -undefined dynamic_lookup which allows missing symbols
+            # to be resolved at runtime
+            pass  # macOS uses runtime linking only, no link-time library dependencies
 
         # Make sure that the runtime linker can find shared object
         # dependencies by using the relative path to the dependency library.
@@ -387,7 +500,7 @@ def create_extension(extension_name, module_dir,
         if platform.system() == 'Linux':
             # $ORIGIN refers to the location of the current shared object file
             # at runtime
-            runtime_library_dirs.append("\$ORIGIN/%s" % rel_path)
+            runtime_library_dirs.append(r"$ORIGIN/%s" % rel_path)
         elif platform.system() == 'Windows':
             pass
         else:  # Assuming non-Windows builds for now
@@ -692,7 +805,7 @@ class TickBuild(build):
 
     @staticmethod
     def extract_swig_version(swig_ver_str):
-        m = re.search('SWIG Version (\d+).(\d+).(\d+)', swig_ver_str)
+        m = re.search(r'SWIG Version (\d+).(\d+).(\d+)', swig_ver_str)
 
         if not m:
             txt = 'Could not extract SWIG version from string: {0}'

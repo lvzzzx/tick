@@ -2,6 +2,7 @@ _*.so
 bin/
 build
 !*build/__init__.py
+tick.egg-info/
 
 # All hidden files except for gitignore
 .*

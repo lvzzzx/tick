@@ -85,6 +85,20 @@ void Hawkes::set_kernel(unsigned int i, unsigned int j, HawkesKernelPtr &kernel)
   kernels[i * n_nodes + j] = kernel;
 }
 
+// Overload that accepts by value (for SWIG compatibility)
+void Hawkes::set_kernel(unsigned int i, unsigned int j, HawkesKernelPtr kernel) {
+  if (i >= n_nodes) TICK_BAD_INDEX(0, n_nodes, i);
+  if (j >= n_nodes) TICK_BAD_INDEX(0, n_nodes, j);
+
+  kernels[i * n_nodes + j].reset();
+
+  if (kernel == nullptr)
+    kernel = std::make_shared<HawkesKernel>();
+  else
+    kernel = kernel->duplicate_if_necessary(kernel);
+  kernels[i * n_nodes + j] = kernel;
+}
+
 HawkesKernelPtr Hawkes::get_kernel(unsigned int i, unsigned int j) {
   if (i >= n_nodes) TICK_BAD_INDEX(0, n_nodes, i);
   if (j >= n_nodes) TICK_BAD_INDEX(0, n_nodes, j);

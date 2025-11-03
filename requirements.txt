@@ -6,3 +6,4 @@ scikit-learn
 pandas
 dill
 packaging
+setuptools
